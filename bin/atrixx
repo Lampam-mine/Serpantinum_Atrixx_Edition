@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# atrixx — управление Serpantinum Atrixx Edition (оверлей поверх Serpantinum).
+set -euo pipefail
+
+ROOT="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
+export ATRIXX_ROOT="$ROOT"
+# shellcheck source=../lib/common.sh
+source "$ROOT/lib/common.sh"
+source "$ROOT/lib/upstream.sh"
+source "$ROOT/compat.conf"
+
+ENABLED_FILE="$ATRIXX_CONF/modules.enabled"
+VERSION="$(cat "$ROOT/VERSION")"
+
+all_modules()  { for d in "$ROOT"/modules/*/; do basename "$d"; done; }
+enabled_list() { [[ -f $ENABLED_FILE ]] && grep -vE '^\s*(#|$)' "$ENABLED_FILE" || echo core; }
+is_enabled()   { enabled_list | grep -qx "$1"; }
+set_enabled()  { mkdir -p "$ATRIXX_CONF"; printf '%s\n' "$@" >"$ENABLED_FILE"; }
+
+run_mod() { # run_mod <id> <apply|revert|desc>
+  local f="$ROOT/modules/$1/module.sh"
+  [[ -f $f ]] || { warn "Модуль '$1' не найден."; return 1; }
+  ( source "$f"; "mod_$2" )
+}
+
+preflight() {
+  local c miss=()
+  for c in git curl flock sha256sum awk; do have "$c" || miss+=("$c"); done
+  ((${#miss[@]} == 0)) || die "Не хватает утилит: ${miss[*]}"
+}
+
+# Идемпотентно применяет все включённые модули. Core всегда первым.
+reapply_all() {
+  local m fail=0
+  for m in core $(enabled_list | grep -vx core || true); do
+    if run_mod "$m" apply; then log "модуль $m: ok"; else warn "модуль $m: ОШИБКА (остальные продолжат)"; fail=1; fi
+  done
+  mkdir -p "$ATRIXX_STATE"
+  { echo "ATRIXX_VERSION=$VERSION"; echo "APPLIED_AT=$(date -Is)"; } >"$ATRIXX_STATE/state.env"
+  return $fail
+}
+
+self_update() {
+  [[ -d $ROOT/.git ]] || { warn "$ROOT не git-checkout — самообновление пропущено."; return 0; }
+  git -C "$ROOT" diff --quiet && git -C "$ROOT" diff --cached --quiet \
+    || die "В $ROOT есть локальные изменения. Закоммитьте или уберите их (git stash)."
+  git -C "$ROOT" pull --ff-only
+}
+
+cmd_install() {
+  not_root; preflight; take_lock
+  if ! upstream_present; then
+    warn "Оригинальный Serpantinum не найден."
+    upstream_run
+  fi
+  [[ -f $ENABLED_FILE ]] || set_enabled core
+  reapply_all && log "Установка Atrixx Edition завершена (v$VERSION)."
+  have atrixx || warn "Добавьте ~/.local/bin в PATH, чтобы команда 'atrixx' работала."
+}
+
+# update [--no-upstream] [--yes]: 1) обновить Atrixx  2) обновить апстрим  3) переприменить оверлей
+cmd_update() {
+  not_root; preflight; take_lock
+  self_update
+  release_lock
+  exec "$ROOT/bin/atrixx" _update_tail "$@"   # перезапуск уже НОВОГО кода
+}
+cmd__update_tail() {
+  take_lock
+  local do_up=1 a
+  for a in "$@"; do
+    case $a in
+      --no-upstream) do_up=0 ;;
+      --yes) export ATRIXX_YES=1 ;;
+    esac
+  done
+  ((do_up)) && upstream_run          # сперва апстрим…
+  check_compat || die "Отменено: оверлей не применён."
+  reapply_all                        # …затем оверлей поверх
+  log "Обновление завершено."
+}
+
+cmd_enable() {
+  [[ -n ${1:-} ]] || die "usage: atrixx enable <module>"
+  is_enabled "$1" && { log "$1 уже включён."; return 0; }
+  not_root; take_lock
+  run_mod "$1" apply || die "Не удалось применить модуль $1."
+  { enabled_list; echo "$1"; } | sort -u >"$ENABLED_FILE.new"
+  mv "$ENABLED_FILE.new" "$ENABLED_FILE"
+  log "$1 включён."
+}
+cmd_disable() { [[ -n ${1:-} ]] || die "usage: atrixx disable <module>"
+  [[ $1 != core ]] || die "core отключить нельзя (используйте 'atrixx uninstall')."
+  not_root; take_lock
+  run_mod "$1" revert
+  enabled_list | grep -vx "$1" >"$ENABLED_FILE.new" || true; mv "$ENABLED_FILE.new" "$ENABLED_FILE"; log "$1 отключён."; }
+
+cmd_uninstall() {
+  not_root; take_lock
+  local m
+  for m in $(enabled_list | grep -vx core) core; do run_mod "$m" revert || warn "revert $m: ошибка"; done
+  rm -f "$ENABLED_FILE"
+  log "Оверлей снят. Оригинальный Serpantinum и ваши файлы в $ATRIXX_CONF не тронуты."
+}
+
+cmd_status() {
+  echo "Atrixx Edition : v$VERSION"
+  echo "Апстрим        : $(upstream_present && echo установлен || echo 'НЕ найден')"
+  echo "Последний релиз апстрима: $(upstream_latest) (проверено: $TESTED_UPSTREAM.x)"
+  echo "Модули:"
+  local m
+  for m in $(all_modules); do
+    printf '  %-12s %-9s %s\n' "$m" "$(is_enabled "$m" && echo включён || echo выключен)" "$(run_mod "$m" desc)"
+  done
+}
+
+cmd_doctor() {
+  local rc=0 c
+  for c in git curl flock sha256sum awk; do have "$c" && echo "ok   $c" || { echo "FAIL $c"; rc=1; }; done
+  [[ :$PATH: == *":$HOME/.local/bin:"* ]] && echo "ok   ~/.local/bin в PATH" || { echo "WARN ~/.local/bin нет в PATH"; }
+  upstream_present && echo "ok   serpantinumd найден" || { echo "WARN serpantinumd не найден"; }
+  local f
+  for f in "$HOME/.config/hypr/hyprland.conf" "$HOME/.config/sway/config"; do
+    if [[ -f $f ]]; then
+      block_has "$f" '#' core && echo "ok   блок Atrixx в $f" || echo "WARN блок Atrixx отсутствует в $f (atrixx reapply)"
+    fi
+  done
+  return $rc
+}
+
+usage() {
+  cat <<EOF
+atrixx v$VERSION
+  install            поставить оверлей (и апстрим, если его нет)
+  update [--no-upstream] [--yes]
+                     обновить Atrixx, затем апстрим, затем переприменить оверлей
+  reapply            переприменить оверлей (после ручного обновления апстрима)
+  enable|disable <m> включить/выключить модуль
+  status | doctor    состояние / диагностика
+  uninstall          снять оверлей (апстрим не трогается)
+EOF
+}
+
+case "${1:-help}" in
+  install)   shift; cmd_install "$@" ;;
+  update)    shift; cmd_update "$@" ;;
+  _update_tail) shift; cmd__update_tail "$@" ;;
+  reapply)   not_root; take_lock; reapply_all ;;
+  enable)    shift; cmd_enable "$@" ;;
+  disable)   shift; cmd_disable "$@" ;;
+  status)    cmd_status ;;
+  doctor)    cmd_doctor ;;
+  uninstall) cmd_uninstall ;;
+  *)         usage ;;
+esac
